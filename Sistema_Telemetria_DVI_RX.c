@@ -7,6 +7,7 @@
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
 #include "hardware/uart.h"
+#include "hardware/watchdog.h"
 #include "config.h"
 
 #include <stdio.h>
@@ -60,19 +61,98 @@ struct dvi_inst dvi0;
 char charbuf[CHAR_ROWS * CHAR_COLS];
 uint32_t colourbuf[3 * COLOUR_PLANE_SIZE_WORDS];
 
+// Definições para o histórico (Mínimos e Máximos)
+static float max_temp = -999.0f;
+static float min_temp = 999.0f;
+static float max_hum  = -999.0f;
+static float min_hum  = 999.0f;
+volatile uint32_t core1_heartbeat = 0;
+
 // Uso do botão B para o BOOTSEL
 #define botaoB 6
 void gpio_irq_handler(uint gpio, uint32_t events) {
     reset_usb_boot(0, 0);
 }
 
-#define USE_MOCK_DATA 0
+#define USE_MOCK_DATA 1
 
 // declaração de funções
 void core1_main();
 void draw_border();
 static inline void set_colour(uint x, uint y, uint8_t fg, uint8_t bg);
 static inline void set_char(uint x, uint y, char c);
+
+// --- FUNÇÕES DE DASHBOARD ---
+
+void draw_dashboard(float current_temp, float current_hum) {
+    // 1. Limpa área interna (preserva bordas)
+    for (int y = 1; y < CHAR_ROWS - 1; y++) {
+        for (int x = 1; x < CHAR_COLS - 1; x++) {
+            set_char(x, y, ' ');
+            set_colour(x, y, 0x00, 0x00);
+        }
+    }
+
+    // 2. Título Centralizado
+    const char *title = "MONITORAMENTO AMBIENTAL";
+    int title_x = (CHAR_COLS - strlen(title)) / 2;
+    for (int i = 0; i < strlen(title); i++) {
+        set_char(title_x + i, 2, title[i]);
+        set_colour(title_x + i, 2, 0x3f, 0x00); // Branco
+    }
+
+    // 3. Exibe Valores Atuais (Texto Grande/Colorido)
+    char buf[32];
+    sprintf(buf, "TEMP: %.2f C", current_temp);
+    for (int i = 0; i < strlen(buf); i++) {
+        set_char(4 + i, 4, buf[i]);
+        set_colour(4 + i, 4, 0x03, 0x00); // Vermelho (simulado)
+    }
+
+    sprintf(buf, "HUM: %.2f %%", current_hum);
+    int hum_x = CHAR_COLS - 4 - strlen(buf);
+    for (int i = 0; i < strlen(buf); i++) {
+        set_char(hum_x + i, 4, buf[i]);
+        set_colour(hum_x + i, 4, 0x30, 0x00); // Azul (simulado)
+    }
+
+    
+
+    // Atualiza Mínimos e Máximos
+    if(current_temp > max_temp) { max_temp = current_temp; }
+    if(current_temp < min_temp) { min_temp = current_temp; }
+    if(current_hum > max_hum) { max_hum  = current_hum; }
+    if(current_hum < min_hum) { min_hum  = current_hum; }
+
+
+    // 4. Exibe Estatísticas (Max/Min)
+    char buf_stats[40];
+    
+    // Stats Temp (Linha 6 e 7)
+    sprintf(buf_stats, "MAX: %.1f C", max_temp);
+    for (int i = 0; i < strlen(buf_stats); i++) {
+        set_char(4 + i, 6, buf_stats[i]);
+        set_colour(4 + i, 6, 0x15, 0x00); // Cinza Claro
+    }
+    sprintf(buf_stats, "MIN: %.1f C", min_temp);
+    for (int i = 0; i < strlen(buf_stats); i++) {
+        set_char(4 + i, 7, buf_stats[i]);
+        set_colour(4 + i, 7, 0x15, 0x00); // Cinza Claro
+    }
+
+    // Stats Hum (Linha 6 e 7 - Direita)
+    sprintf(buf_stats, "MAX: %.1f %%", max_hum);
+    int stats_x = CHAR_COLS - 4 - 15; // Ajuste aproximado
+    for (int i = 0; i < strlen(buf_stats); i++) {
+        set_char(stats_x + i, 6, buf_stats[i]);
+        set_colour(stats_x + i, 6, 0x15, 0x00); // Cinza Claro
+    }
+    sprintf(buf_stats, "MIN: %.1f %%", min_hum);
+    for (int i = 0; i < strlen(buf_stats); i++) {
+        set_char(stats_x + i, 7, buf_stats[i]);
+        set_colour(stats_x + i, 7, 0x15, 0x00); // Cinza Claro
+    }
+}
 
 static void mock_sensor_data(sensor_data_t *dados) {
     static float temp = 24.0f;
@@ -117,12 +197,26 @@ int __not_in_flash("main") main() {
     sleep_ms(10);
     set_sys_clock_khz(DVI_TIMING.bit_clk_khz, true);
 
-    // stdio_init_all();
+    stdio_init_all();
+    
+    // Checa motivo do reset
+    if (watchdog_caused_reboot()) {
+        printf("ALERTA: Reinicializacao causada pelo Watchdog!\n");
+    } else {
+        printf("Inicializacao limpa (Power On).\n");
+    }
+
+    // Configura Watchdog para 4000ms (4 segundos)
+    // Tempo suficiente para latencias de vídeo e UART
+    watchdog_enable(4000, 1);
     // --- CONFIGURAÇÃO DO BOTÃO BOOTSEL ---
     gpio_init(botaoB);
     gpio_set_dir(botaoB, GPIO_IN);
     gpio_pull_up(botaoB);
     gpio_set_irq_enabled_with_callback(botaoB, GPIO_IRQ_EDGE_FALL, true, &gpio_irq_handler);
+
+    gpio_init(LED_BLUE);
+    gpio_set_dir(LED_BLUE, GPIO_OUT);
 
     init_dvi();
 
@@ -130,8 +224,8 @@ int __not_in_flash("main") main() {
     uart_init(UART_ID, UART_BAUDRATE);
     gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
     gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
-    uart_set_format(UART_ID, 8, 1, UART_PARITY_NONE);
-    uart_set_fifo_enabled(UART_ID, true);
+    // uart_set_format(UART_ID, 8, 1, UART_PARITY_NONE);
+    // uart_set_fifo_enabled(UART_ID, true);
 
 
     // Inicia Core 1
@@ -149,64 +243,31 @@ int __not_in_flash("main") main() {
         #if USE_MOCK_DATA
             mock_sensor_data(&dados);
 
-            // Define as partes da mensagem
-            char value_msg[24]; // Buffer para o valor numérico
-            sprintf(value_msg, "TEMP: %.2f C - HUM: %.2f %%\n", dados.temperature, dados.humidity);
-            const int value_len = strlen(value_msg);
-
-            // Centraliza na tela
-            int start_y = (CHAR_ROWS / 2) - 1;; // Linha central (considerando altura da fonte) 
-            int start_x = (CHAR_COLS / 2) - (value_len / 2); 
-
-            // Limpa a área de texto
-            for (int i = 1; i < CHAR_COLS - 1; ++i) {
-                set_char(i, start_y, ' ');
-                // Garante que o fundo seja o mesmo da borda
-                set_colour(i, start_y, 0x00, 0x00); 
-            }
-            
-            // Escreve a parte do texto estático em branco
-            for (int i = 0; i < value_len; ++i) {
-                set_char(start_x + i, start_y, value_msg[i]);
-                // Texto branco escuro
-                set_colour(start_x + i, start_y, 0x3f, 0x03); 
-            }
+            // Atualiza display
+            draw_dashboard(dados.temperature, dados.humidity);
 
             sleep_ms(500); 
 
         #else
+        // Comando experimental para simular travamento
             while (uart_is_readable(UART_ID)) {
-                printf("Fila da UART não está vazia\n");
+                gpio_put(LED_BLUE, 1);
                 char c = uart_getc(UART_ID);
 
                 if (c == '\n') {
                     rx_buffer[index] = '\0';
                     index = 0;
+                    
+                    // Digite "KILL" ou 'k' para travar o Core 0
+                    if (strcmp(rx_buffer, "KILL") == 0 || rx_buffer[0] == 'k') {
+                        printf("Simulando travamento (loop infinito)...\n");
+                        while(true); // Loop infinito para forçar watchdog
+                    }
 
                     float temp, hum;
                     if (sscanf(rx_buffer, "TEMP:%.2f;HUM:%.2f\n", &temp, &hum) == 2) {
-                        // Define as partes da mensagem
-                        char value_msg[24]; // Buffer para o valor numérico
-                        sprintf(value_msg, "TEMP: %.2f C - HUM: %.2f %%", temp, hum);
-                        const int value_len = strlen(value_msg);
-
-                        // Centraliza na tela
-                        int start_y = (CHAR_ROWS / 2) - 1;; // Linha central (considerando altura da fonte) 
-                        int start_x = (CHAR_COLS / 2) - (value_len / 2); 
-
-                        // Limpa a área de texto
-                        for (int i = 1; i < CHAR_COLS - 1; ++i) {
-                            set_char(i, start_y, ' ');
-                            // Garante que o fundo seja o mesmo da borda
-                            set_colour(i, start_y, 0x00, 0x00); 
-                        }
-                        
-                        // Escreve a parte do texto estático em branco
-                        for (int i = 0; i < value_len; ++i) {
-                            set_char(start_x + i, start_y, value_msg[i]);
-                            // Texto branco escuro
-                            set_colour(start_x + i, start_y, 0x3f, 0x03); 
-                        }
+                        // Atualiza display
+                        draw_dashboard(temp, hum);
                     }
                 }
                 else if (index < RX_BUFFER_SIZE - 1) {
@@ -217,8 +278,20 @@ int __not_in_flash("main") main() {
                     index = 0;
                 }
             }
+            gpio_put(LED_BLUE, 0);
+
             sleep_ms(1);
         #endif
+        
+        // --- GERENCIAMENTO DO WATCHDOG --- 
+        // Apenas alimenta o watchdog se o Core 1 estiver ativo (heartbeat variando)
+        static uint32_t last_heartbeat = 0;
+        if (core1_heartbeat != last_heartbeat) {
+            watchdog_update();
+            last_heartbeat = core1_heartbeat;
+        } else {
+            // Se o Core 1 travou, o heartbeat não muda, watchdog não é alimentado -> Reset.
+        }
     }
 }
 
@@ -303,6 +376,7 @@ void core1_main() {
             }
             queue_add_blocking(&dvi0.q_tmds_valid, &tmdsbuf);
         }
+        core1_heartbeat++;
     }
 }
 
