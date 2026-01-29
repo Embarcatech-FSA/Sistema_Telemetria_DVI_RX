@@ -74,7 +74,7 @@ void gpio_irq_handler(uint gpio, uint32_t events) {
     reset_usb_boot(0, 0);
 }
 
-#define USE_MOCK_DATA 1
+#define USE_MOCK_DATA 0
 
 // declaração de funções
 void core1_main();
@@ -116,7 +116,6 @@ void draw_dashboard(float current_temp, float current_hum) {
         set_colour(hum_x + i, 4, 0x30, 0x00); // Azul (simulado)
     }
 
-    
 
     // Atualiza Mínimos e Máximos
     if(current_temp > max_temp) { max_temp = current_temp; }
@@ -224,9 +223,8 @@ int __not_in_flash("main") main() {
     uart_init(UART_ID, UART_BAUDRATE);
     gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
     gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
-    // uart_set_format(UART_ID, 8, 1, UART_PARITY_NONE);
-    // uart_set_fifo_enabled(UART_ID, true);
-
+    uart_set_format(UART_ID, 8, 1, UART_PARITY_NONE);
+    uart_set_fifo_enabled(UART_ID, true);
 
     // Inicia Core 1
     hw_set_bits(&bus_ctrl_hw->priority, BUSCTRL_BUS_PRIORITY_PROC1_BITS);
@@ -235,28 +233,23 @@ int __not_in_flash("main") main() {
     static sensor_data_t dados;
     static char rx_buffer[RX_BUFFER_SIZE];
     uint8_t index = 0;
-    union {
-        float f;
-        uint32_t u;
-    } conv;
+
     while (true) {
         #if USE_MOCK_DATA
             mock_sensor_data(&dados);
-
-            // Atualiza display
             draw_dashboard(dados.temperature, dados.humidity);
-
             sleep_ms(500); 
 
         #else
-        // Comando experimental para simular travamento
+            // Verifica se há dados disponíveis para leitura
             while (uart_is_readable(UART_ID)) {
-                gpio_put(LED_BLUE, 1);
+                // Lê o caractere recebido
                 char c = uart_getc(UART_ID);
 
+                // Adiciona o caractere ao buffer se não for '\n'
                 if (c == '\n') {
+                    // Final da mensagem
                     rx_buffer[index] = '\0';
-                    index = 0;
                     
                     // Digite "KILL" ou 'k' para travar o Core 0
                     if (strcmp(rx_buffer, "KILL") == 0 || rx_buffer[0] == 'k') {
@@ -264,23 +257,33 @@ int __not_in_flash("main") main() {
                         while(true); // Loop infinito para forçar watchdog
                     }
 
-                    float temp, hum;
-                    if (sscanf(rx_buffer, "TEMP:%.2f;HUM:%.2f\n", &temp, &hum) == 2) {
-                        // Atualiza display
+                    float temp = 0.0f, hum = 0.0f;
+                    if (sscanf(rx_buffer, "TEMP:%f;HUM:%f", &temp, &hum) == 2) {
                         draw_dashboard(temp, hum);
+                        printf("TEMP: %.2f HUM: %.2f\n", temp, hum);
+
+                        // Feedback visual
+                        gpio_put(LED_BLUE, 1);
+                        sleep_ms(50);
+                        gpio_put(LED_BLUE, 0);
                     }
-                }
-                else if (index < RX_BUFFER_SIZE - 1) {
-                    rx_buffer[index++] = c;
-                }
-                else {
-                    // overflow defensivo
+
+                    // Pronto para próxima mensagem
                     index = 0;
                 }
+                else {
+                    // Acumula bytes da mensagem
+                    if (index < sizeof(rx_buffer) - 1) {
+                        rx_buffer[index++] = c;
+                    } else {
+                        // Overflow → descarta mensagem inteira
+                        index = 0;
+                    }
+                }
             }
-            gpio_put(LED_BLUE, 0);
+            // Pequeno atraso para evitar sobrecarga no loop principal
+            sleep_ms(10);
 
-            sleep_ms(1);
         #endif
         
         // --- GERENCIAMENTO DO WATCHDOG --- 
